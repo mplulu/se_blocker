@@ -11,22 +11,17 @@ import (
 )
 
 func blockIPInFirewall(ip string) {
-	cmd := exec.Command("sh", "-c", fmt.Sprintf(`sudo firewall-cmd --time-out="30m" --add-rich-rule="rule family='ipv4' source address='%v' reject"`, ip))
+	cmd := exec.Command("sh", "-c", fmt.Sprintf(`sudo firewall-cmd --timeout=30m --add-rich-rule="rule family='ipv4' source address='%v' reject"`, ip))
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output1 %v %v", string(stdout), err)
 		return
 	}
-
-	cmd = exec.Command("sh", "-c", `sudo firewall-cmd --reload`)
-	stdout, err = cmd.CombinedOutput()
-	if err != nil {
-		log.LogSerious("output2 %v %v", string(stdout), err)
-	}
+	log.Log("block %v", ip)
 }
 
 func scheduleBlocker() {
-	cmd := exec.Command("sh", "-c", "netstat -tn 2>/dev/null | grep :80 | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head")
+	cmd := exec.Command("sh", "-c", "netstat -tn 2>/dev/null | grep :443 | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head")
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output0 %v %v", string(stdout), err)
