@@ -1,4 +1,4 @@
-module github.com/arrowltd/se_blocker
+module github.com/mplulu/se_blocker
 
 go 1.17
 
