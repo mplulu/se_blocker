@@ -1,14 +1,24 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"math/rand"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/mplulu/renv"
+
+	"github.com/mplulu/utils"
+
 	"github.com/mplulu/log"
 )
+
+type ENV struct {
+	WhitelistIps []string `yaml:"whitelist_ips"`
+}
 
 func blockIPInFirewall(ip string) {
 	cmd := exec.Command("sh", "-c", fmt.Sprintf(`sudo firewall-cmd --timeout=30m --add-rich-rule="rule family='ipv4' source address='%v' reject"`, ip))
@@ -20,7 +30,7 @@ func blockIPInFirewall(ip string) {
 	log.Log("block %v", ip)
 }
 
-func scheduleBlocker() {
+func scheduleBlocker(env *ENV) {
 	cmd := exec.Command("sh", "-c", "netstat -tn 2>/dev/null | grep :443 | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head")
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
@@ -37,16 +47,21 @@ func scheduleBlocker() {
 			countStr := strings.TrimSpace(tokens[0])
 			ip := strings.TrimSpace(tokens[1])
 			count, _ := strconv.Atoi(countStr)
-			if count > 100 {
+			if count > 100 && !utils.ContainsByString(env.WhitelistIps, ip) {
 				blockIPInFirewall(ip)
 			}
 		}
 	}
 	<-time.After(15 * time.Second)
-	go scheduleBlocker()
+	go scheduleBlocker(env)
 }
 
 func main() {
-	go scheduleBlocker()
+	flag.Parse()
+	rand.Seed(time.Now().UTC().UnixNano())
+	var env *ENV
+	renv.ParseCmd(&env)
+	log.Log("Whitelist IPs: %v", strings.Join(env.WhitelistIps, " "))
+	go scheduleBlocker(env)
 	select {}
 }
