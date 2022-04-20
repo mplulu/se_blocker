@@ -4,6 +4,7 @@ go 1.17
 
 require (
 	github.com/mplulu/log v0.0.0-20180902174022-ff16d72d141f
+	github.com/mplulu/rano v1.0.3
 	github.com/mplulu/renv v1.0.1
 	github.com/mplulu/utils v0.0.0-20181230153924-60e2842a77ad
 )

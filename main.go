@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mplulu/rano"
+
 	"github.com/mplulu/renv"
 
 	"github.com/mplulu/utils"
@@ -22,11 +24,15 @@ const kBanForDurationStr = "30m"
 const kCheckDuplicateBlockDuration = 5 * time.Minute
 
 type ENV struct {
-	WhitelistIps []string `yaml:"whitelist_ips"`
+	WhitelistIps     []string `yaml:"whitelist_ips"`
+	OwnIp            string   `yaml:"own_ip"`
+	TelegramBotToken string   `yaml:"telegram_bot_token"`
+	TelegramChatId   string   `yaml:"telegram_chat_id"`
 }
 
 type Center struct {
 	env           *ENV
+	tlgBot        *rano.Rano
 	blockedIpList []*BlockedIP
 }
 
@@ -70,6 +76,12 @@ func (center *Center) IsIpAlreadyBlocked(ip string) bool {
 	return false
 }
 
+func (center *Center) notifyMT(text string) {
+	if center.tlgBot != nil {
+		center.tlgBot.Send(text)
+	}
+}
+
 func (center *Center) scheduleBlocker() {
 	env := center.env
 	cmd := exec.Command("sh", "-c", "netstat -tn 2>/dev/null | grep :443 | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr")
@@ -102,6 +114,8 @@ func (center *Center) scheduleBlocker() {
 		finished := make(chan bool, 1)
 		counter := 0
 		log.Log("will block %v ips", len(willBeBlockedList))
+		message := fmt.Sprintf("will block %v ips. %v", len(willBeBlockedList), strings.Join(willBeBlockedList, " "))
+		center.notifyMT(message)
 		for _, ip := range willBeBlockedList {
 			queues <- true
 			go func(ipInBlock string) {
@@ -129,6 +143,9 @@ func main() {
 	center := &Center{
 		env:           env,
 		blockedIpList: []*BlockedIP{},
+	}
+	if env.TelegramBotToken != "" && env.TelegramChatId != "" {
+		center.tlgBot = rano.NewRano(env.TelegramBotToken, []string{env.TelegramChatId})
 	}
 	go center.scheduleBlocker()
 	select {}
