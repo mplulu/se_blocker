@@ -40,6 +40,8 @@ func scheduleBlocker(env *ENV) {
 		log.LogSerious("output0 %v %v", string(stdout), err)
 	}
 	lines := strings.Split(string(stdout), "\n")
+
+	willBeBlockedList := []string{}
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if len(line) == 0 {
@@ -51,10 +53,31 @@ func scheduleBlocker(env *ENV) {
 			ip := strings.TrimSpace(tokens[1])
 			count, _ := strconv.Atoi(countStr)
 			if count > kMaxCount && !utils.ContainsByString(env.WhitelistIps, ip) {
-				blockIPInFirewall(ip)
+				willBeBlockedList = append(willBeBlockedList, ip)
+
 			}
 		}
 	}
+
+	if len(willBeBlockedList) > 0 {
+		queues := make(chan bool, 30)
+		finished := make(chan bool, 1)
+		counter := 0
+		log.Log("will block %v ips", len(willBeBlockedList))
+		for _, ip := range willBeBlockedList {
+			queues <- true
+			go func() {
+				blockIPInFirewall(ip)
+				counter++
+				if counter == len(willBeBlockedList) {
+					finished <- true
+				}
+				<-queues
+			}()
+		}
+		<-finished
+	}
+
 	<-time.After(kInterval)
 	go scheduleBlocker(env)
 }
