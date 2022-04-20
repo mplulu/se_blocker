@@ -114,7 +114,7 @@ func (center *Center) scheduleBlocker() {
 		finished := make(chan bool, 1)
 		counter := 0
 		log.Log("will block %v ips", len(willBeBlockedList))
-		message := fmt.Sprintf("will block %v ips. %v", len(willBeBlockedList), strings.Join(willBeBlockedList, " "))
+		message := fmt.Sprintf("%v will block %v ips. %v", center.env.OwnIp, len(willBeBlockedList), strings.Join(willBeBlockedList, " "))
 		center.notifyMT(message)
 		for _, ip := range willBeBlockedList {
 			queues <- true
