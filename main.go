@@ -98,6 +98,8 @@ func (center *Center) scheduleBlocker() {
 	willBeBlockedList := []string{}
 
 	totalCount := 0
+	totalIpAccess := 0
+	totalCountWillBeBlocked := 0
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if len(line) == 0 {
@@ -111,11 +113,15 @@ func (center *Center) scheduleBlocker() {
 			totalCount += count
 			if count > center.env.MaxCount && !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
 				willBeBlockedList = append(willBeBlockedList, ip)
-
+				totalCountWillBeBlocked += count
 			}
+			totalIpAccess++
 		}
 	}
 	if totalCount > center.env.MaxTotalCount {
+		log.Log("Stats totalConnection %v, totalIps %v, average %v. TotalConnWillBeBlocked %.2f, totalIpsWillBeBlocked %v, average %.2f ",
+			totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess),
+			totalCountWillBeBlocked, len(willBeBlockedList), float64(totalCountWillBeBlocked)/float64(len(willBeBlockedList)))
 		if len(willBeBlockedList) > 0 {
 			queues := make(chan bool, 30)
 			finished := make(chan bool, 1)
