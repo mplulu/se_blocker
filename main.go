@@ -37,15 +37,17 @@ type BlockedIP struct {
 
 func (center *Center) killTCPConnection(ip string) {
 	cmd := exec.Command("sh", "-c", fmt.Sprintf(`sudo tcpkill -i any -9 host %v`, ip))
-	_, err := cmd.CombinedOutput()
+	stdout, err := cmd.CombinedOutput()
 	if err != nil {
-		log.LogSerious("output3 %v", err)
+		log.LogSerious("output3 %v %v", string(stdout), err)
 		return
 	}
 }
 
 func (center *Center) blockIPInFirewall(ip string) {
-	cmd := exec.Command("sh", "-c", fmt.Sprintf(`sudo firewall-cmd --timeout=30m --add-rich-rule="rule family='ipv4' source address='%v' reject"`, ip))
+	cmd := exec.Command("sh", "-c", fmt.Sprintf(
+		`sudo firewall-cmd --timeout=%v --add-rich-rule="rule family='ipv4' source address='%v' drop"`,
+		kBanForDurationStr, ip))
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output1 %v %v", string(stdout), err)
