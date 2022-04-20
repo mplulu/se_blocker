@@ -66,14 +66,14 @@ func scheduleBlocker(env *ENV) {
 		log.Log("will block %v ips", len(willBeBlockedList))
 		for _, ip := range willBeBlockedList {
 			queues <- true
-			go func() {
-				blockIPInFirewall(ip)
+			go func(ipInBlock string) {
+				blockIPInFirewall(ipInBlock)
 				counter++
 				if counter == len(willBeBlockedList) {
 					finished <- true
 				}
 				<-queues
-			}()
+			}(ip)
 		}
 		<-finished
 	}
