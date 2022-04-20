@@ -16,6 +16,9 @@ import (
 	"github.com/mplulu/log"
 )
 
+const kInterval = 1 * time.Second
+const kMaxCount = 50
+
 type ENV struct {
 	WhitelistIps []string `yaml:"whitelist_ips"`
 }
@@ -47,12 +50,12 @@ func scheduleBlocker(env *ENV) {
 			countStr := strings.TrimSpace(tokens[0])
 			ip := strings.TrimSpace(tokens[1])
 			count, _ := strconv.Atoi(countStr)
-			if count > 100 && !utils.ContainsByString(env.WhitelistIps, ip) {
+			if count > kMaxCount && !utils.ContainsByString(env.WhitelistIps, ip) {
 				blockIPInFirewall(ip)
 			}
 		}
 	}
-	<-time.After(15 * time.Second)
+	<-time.After(kInterval)
 	go scheduleBlocker(env)
 }
 
