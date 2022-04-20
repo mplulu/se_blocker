@@ -34,7 +34,7 @@ func blockIPInFirewall(ip string) {
 }
 
 func scheduleBlocker(env *ENV) {
-	cmd := exec.Command("sh", "-c", "netstat -tn 2>/dev/null | grep :443 | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head")
+	cmd := exec.Command("sh", "-c", "netstat -tn 2>/dev/null | grep :443 | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr")
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output0 %v %v", string(stdout), err)
