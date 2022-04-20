@@ -19,7 +19,8 @@ import (
 )
 
 const kInterval = 1 * time.Second
-const kMaxCount = 30
+const kMaxCount = 50
+const kMaxTotalCount = 10000
 const kBanForDurationStr = "30m"
 const kCheckDuplicateBlockDuration = 5 * time.Minute
 
@@ -28,6 +29,9 @@ type ENV struct {
 	OwnIp            string   `yaml:"own_ip"`
 	TelegramBotToken string   `yaml:"telegram_bot_token"`
 	TelegramChatId   string   `yaml:"telegram_chat_id"`
+
+	MaxCount      int `yaml:"max_count"`
+	MaxTotalCount int `yaml:"max_total_count"`
 }
 
 type Center struct {
@@ -92,6 +96,8 @@ func (center *Center) scheduleBlocker() {
 	lines := strings.Split(string(stdout), "\n")
 
 	willBeBlockedList := []string{}
+
+	totalCount := 0
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if len(line) == 0 {
@@ -102,32 +108,34 @@ func (center *Center) scheduleBlocker() {
 			countStr := strings.TrimSpace(tokens[0])
 			ip := strings.TrimSpace(tokens[1])
 			count, _ := strconv.Atoi(countStr)
-			if count > kMaxCount && !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
+			totalCount += count
+			if count > center.env.MaxCount && !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
 				willBeBlockedList = append(willBeBlockedList, ip)
 
 			}
 		}
 	}
-
-	if len(willBeBlockedList) > 0 {
-		queues := make(chan bool, 30)
-		finished := make(chan bool, 1)
-		counter := 0
-		log.Log("will block %v ips", len(willBeBlockedList))
-		message := fmt.Sprintf("%v will block %v ips. %v", center.env.OwnIp, len(willBeBlockedList), strings.Join(willBeBlockedList, " "))
-		center.notifyMT(message)
-		for _, ip := range willBeBlockedList {
-			queues <- true
-			go func(ipInBlock string) {
-				center.blockIPInFirewall(ipInBlock)
-				counter++
-				if counter == len(willBeBlockedList) {
-					finished <- true
-				}
-				<-queues
-			}(ip)
+	if totalCount > center.env.MaxTotalCount {
+		if len(willBeBlockedList) > 0 {
+			queues := make(chan bool, 30)
+			finished := make(chan bool, 1)
+			counter := 0
+			log.Log("will block %v ips", len(willBeBlockedList))
+			message := fmt.Sprintf("%v will block %v ips. %v", center.env.OwnIp, len(willBeBlockedList), strings.Join(willBeBlockedList, " "))
+			center.notifyMT(message)
+			for _, ip := range willBeBlockedList {
+				queues <- true
+				go func(ipInBlock string) {
+					center.blockIPInFirewall(ipInBlock)
+					counter++
+					if counter == len(willBeBlockedList) {
+						finished <- true
+					}
+					<-queues
+				}(ip)
+			}
+			<-finished
 		}
-		<-finished
 	}
 
 	<-time.After(kInterval)
