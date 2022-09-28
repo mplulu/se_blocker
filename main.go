@@ -21,8 +21,7 @@ import (
 const kInterval = 1 * time.Second
 const kMaxCount = 50
 const kMaxTotalCount = 10000
-const kBanForDurationStr = "30m"
-const kCheckDuplicateBlockDuration = 5 * time.Minute
+const kBanForDurationStr = "168h"
 
 type ENV struct {
 	WhitelistIps     []string `yaml:"whitelist_ips"`
@@ -30,8 +29,9 @@ type ENV struct {
 	TelegramBotToken string   `yaml:"telegram_bot_token"`
 	TelegramChatId   string   `yaml:"telegram_chat_id"`
 
-	MaxCount      int `yaml:"max_count"`
-	MaxTotalCount int `yaml:"max_total_count"`
+	MaxCount      int    `yaml:"max_count"`
+	MaxTotalCount int    `yaml:"max_total_count"`
+	BanDuration   string `yaml:"ban_duration"`
 }
 
 type Center struct {
@@ -48,7 +48,7 @@ type BlockedIP struct {
 func (center *Center) blockIPInFirewall(ip string) {
 	cmd := exec.Command("sh", "-c", fmt.Sprintf(
 		`sudo firewall-cmd --timeout=%v --add-rich-rule="rule family='ipv4' source address='%v' drop"`,
-		kBanForDurationStr, ip))
+		center.env.BanDuration, ip))
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output1 %v %v", string(stdout), err)
@@ -64,7 +64,7 @@ func (center *Center) blockIPInFirewall(ip string) {
 func (center *Center) IsIpAlreadyBlocked(ip string) bool {
 	for _, blockedIP := range center.blockedIpList {
 		if blockedIP.ip == ip {
-			return time.Since(blockedIP.blockedAt) < kCheckDuplicateBlockDuration
+			return true
 		}
 	}
 	return false
