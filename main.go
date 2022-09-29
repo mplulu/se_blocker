@@ -21,7 +21,7 @@ import (
 const kInterval = 1 * time.Second
 const kMaxCount = 50
 const kMaxTotalCount = 10000
-const kBanForDurationStr = "168h"
+const kExpireIpBlockedDuration = 5 * time.Second
 
 type ENV struct {
 	WhitelistIps     []string `yaml:"whitelist_ips"`
@@ -109,7 +109,7 @@ func (center *Center) scheduleBlocker() {
 		}
 	}
 	if totalCount > center.env.MaxTotalCount {
-		log.Log("Stats totalConnection %v, totalIps %v, average %v. TotalConnWillBeBlocked %.2f, totalIpsWillBeBlocked %v, average %.2f ",
+		log.Log("Stats totalConnection %v, totalIps %v, average %.2f. TotalConnWillBeBlocked %v, totalIpsWillBeBlocked %v, average %.2f ",
 			totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess),
 			totalCountWillBeBlocked, len(willBeBlockedList), float64(totalCountWillBeBlocked)/float64(len(willBeBlockedList)))
 		if len(willBeBlockedList) > 0 {
@@ -117,7 +117,8 @@ func (center *Center) scheduleBlocker() {
 			finished := make(chan bool, 1)
 			counter := 0
 			log.Log("will block %v ips", len(willBeBlockedList))
-			message := fmt.Sprintf("%v will block %v ips. %v", center.env.OwnIp, len(willBeBlockedList), strings.Join(willBeBlockedList, " "))
+			message := fmt.Sprintf("%v will block %v ips (blocked last %v: %v). %v", center.env.OwnIp, len(willBeBlockedList),
+				kExpireIpBlockedDuration.String(), len(center.blockedIpList), strings.Join(willBeBlockedList, " "))
 			center.notifyMT(message)
 			for _, ip := range willBeBlockedList {
 				queues <- true
@@ -133,6 +134,14 @@ func (center *Center) scheduleBlocker() {
 			<-finished
 		}
 	}
+
+	filterExpiredBlockIpList := []*BlockedIP{}
+	for _, blockedIp := range center.blockedIpList {
+		if time.Since(blockedIp.blockedAt) <= kExpireIpBlockedDuration {
+			filterExpiredBlockIpList = append(filterExpiredBlockIpList, blockedIp)
+		}
+	}
+	center.blockedIpList = filterExpiredBlockIpList
 
 	<-time.After(kInterval)
 	go center.scheduleBlocker()
