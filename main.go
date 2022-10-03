@@ -21,7 +21,7 @@ import (
 const kInterval = 1 * time.Second
 const kMaxCount = 50
 const kMaxTotalCount = 10000
-const kExpireIpBlockedDuration = 5 * time.Second
+const kExpireIpBlockedDuration = 5 * time.Minute
 
 type ENV struct {
 	WhitelistIps     []string `yaml:"whitelist_ips"`
