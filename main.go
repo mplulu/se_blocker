@@ -19,9 +19,7 @@ import (
 )
 
 const kInterval = 1 * time.Second
-const kMaxCount = 50
-const kMaxTotalCount = 10000
-const kExpireIpBlockedDuration = 5 * time.Minute
+const kExpireIpBlockedDuration = 10 * time.Minute
 
 type ENV struct {
 	WhitelistIps     []string `yaml:"whitelist_ips"`
@@ -43,22 +41,30 @@ type Center struct {
 type BlockedIP struct {
 	ip        string
 	blockedAt time.Time
+	count     int
 }
 
-func (center *Center) blockIPInFirewall(ip string) {
+func convertBlockedIPListToString(list []*BlockedIP) string {
+	tokens := []string{}
+	for _, entry := range list {
+		token := fmt.Sprintf("%v(%v)", entry.ip, entry.count)
+		tokens = append(tokens, token)
+	}
+	return strings.Join(tokens, " ")
+}
+
+func (center *Center) blockIPInFirewall(ipObjc *BlockedIP) {
 	cmd := exec.Command("sh", "-c", fmt.Sprintf(
 		`sudo firewall-cmd --timeout=%v --add-rich-rule="rule family='ipv4' source address='%v' drop"`,
-		center.env.BanDuration, ip))
+		center.env.BanDuration, ipObjc.ip))
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output1 %v %v", string(stdout), err)
 		return
 	}
-	center.blockedIpList = append(center.blockedIpList, &BlockedIP{
-		ip:        ip,
-		blockedAt: time.Now(),
-	})
-	log.Log("block %v", ip)
+	ipObjc.blockedAt = time.Now()
+	center.blockedIpList = append(center.blockedIpList, ipObjc)
+	log.Log("block %v", ipObjc.ip)
 }
 
 func (center *Center) IsIpAlreadyBlocked(ip string) bool {
@@ -85,7 +91,7 @@ func (center *Center) scheduleBlocker() {
 	}
 	lines := strings.Split(string(stdout), "\n")
 
-	willBeBlockedList := []string{}
+	willBeBlockedList := []*BlockedIP{}
 
 	totalCount := 0
 	totalIpAccess := 0
@@ -102,7 +108,10 @@ func (center *Center) scheduleBlocker() {
 			count, _ := strconv.Atoi(countStr)
 			totalCount += count
 			if count > center.env.MaxCount && !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
-				willBeBlockedList = append(willBeBlockedList, ip)
+				willBeBlockedList = append(willBeBlockedList, &BlockedIP{
+					ip:    ip,
+					count: count,
+				})
 				totalCountWillBeBlocked += count
 			}
 			totalIpAccess++
@@ -117,12 +126,13 @@ func (center *Center) scheduleBlocker() {
 			finished := make(chan bool, 1)
 			counter := 0
 			log.Log("will block %v ips", len(willBeBlockedList))
-			message := fmt.Sprintf("%v will block %v ips (blocked last %v: %v). %v", center.env.OwnIp, len(willBeBlockedList),
-				kExpireIpBlockedDuration.String(), len(center.blockedIpList), strings.Join(willBeBlockedList, " "))
+			message := fmt.Sprintf("%v will block %v ips (totalConnection %v, totalIps %v, average %.2f, TotalConnWillBeBlocked %v) (blocked last %v: %v). %v", center.env.OwnIp, len(willBeBlockedList),
+				totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess), totalCountWillBeBlocked,
+				kExpireIpBlockedDuration.String(), len(center.blockedIpList), convertBlockedIPListToString(willBeBlockedList))
 			center.notifyMT(message)
 			for _, ip := range willBeBlockedList {
 				queues <- true
-				go func(ipInBlock string) {
+				go func(ipInBlock *BlockedIP) {
 					center.blockIPInFirewall(ipInBlock)
 					counter++
 					if counter == len(willBeBlockedList) {
