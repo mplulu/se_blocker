@@ -33,9 +33,10 @@ type ENV struct {
 }
 
 type Center struct {
-	env           *ENV
-	tlgBot        *rano.Rano
-	blockedIpList []*BlockedIP
+	env            *ENV
+	tlgBot         *rano.Rano
+	blockedIpList  []*BlockedIP
+	lastTotalCount int
 }
 
 type BlockedIP struct {
@@ -64,7 +65,7 @@ func (center *Center) blockIPInFirewall(ipObjc *BlockedIP) {
 	}
 	ipObjc.blockedAt = time.Now()
 	center.blockedIpList = append(center.blockedIpList, ipObjc)
-	log.Log("block %v", ipObjc.ip)
+	log.Log("block %v(%v)", ipObjc.ip, ipObjc.count)
 }
 
 func (center *Center) IsIpAlreadyBlocked(ip string) bool {
@@ -126,8 +127,9 @@ func (center *Center) scheduleBlocker() {
 			finished := make(chan bool, 1)
 			counter := 0
 			log.Log("will block %v ips", len(willBeBlockedList))
-			message := fmt.Sprintf("%v will block %v ips (totalConnection %v, totalIps %v, average %.2f, TotalConnWillBeBlocked %v) (blocked last %v: %v). %v", center.env.OwnIp, len(willBeBlockedList),
-				totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess), totalCountWillBeBlocked,
+			message := fmt.Sprintf("%v will block %v ips (totalConnection %v=>%v, totalIps %v, average %.2f, TotalConnWillBeBlocked %v) (blocked last %v: %v). %v",
+				center.env.OwnIp, len(willBeBlockedList),
+				center.lastTotalCount, totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess), totalCountWillBeBlocked,
 				kExpireIpBlockedDuration.String(), len(center.blockedIpList), convertBlockedIPListToString(willBeBlockedList))
 			center.notifyMT(message)
 			for _, ip := range willBeBlockedList {
@@ -152,7 +154,7 @@ func (center *Center) scheduleBlocker() {
 		}
 	}
 	center.blockedIpList = filterExpiredBlockIpList
-
+	center.lastTotalCount = totalCount
 	<-time.After(kInterval)
 	go center.scheduleBlocker()
 }
