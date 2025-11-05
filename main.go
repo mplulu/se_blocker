@@ -139,7 +139,7 @@ func (center *Center) scheduleBlocker() {
 						count: count,
 					})
 					totalCountWillBeBlocked += count
-				} else if count > center.env.MaxCountForStrike {
+				} else if center.env.MaxCountForStrike > 0 && count > center.env.MaxCountForStrike {
 					if center.potentialBlockedList[ip] == nil {
 						center.potentialBlockedList[ip] = &PotentialBlockedIP{
 							ip:            ip,
