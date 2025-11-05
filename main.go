@@ -30,6 +30,9 @@ type ENV struct {
 	MaxCount      int    `yaml:"max_count"`
 	MaxTotalCount int    `yaml:"max_total_count"`
 	BanDuration   string `yaml:"ban_duration"`
+
+	MaxCountForStrike int `yaml:"max_count_for_strike"`
+	StrikeCount       int `yaml:"strike_count"`
 }
 
 type Center struct {
@@ -37,19 +40,35 @@ type Center struct {
 	tlgBot         *rano.Rano
 	blockedIpList  []*BlockedIP
 	lastTotalCount int
+
+	potentialBlockedList map[string]*PotentialBlockedIP
 }
 
 type BlockedIP struct {
 	ip        string
 	blockedAt time.Time
 	count     int
+
+	isStrike bool
+}
+
+type PotentialBlockedIP struct {
+	ip            string
+	count         int
+	strikeCount   int
+	isConsecutive bool
 }
 
 func convertBlockedIPListToString(list []*BlockedIP) string {
 	tokens := []string{}
 	for _, entry := range list {
-		token := fmt.Sprintf("%v(%v)", entry.ip, entry.count)
-		tokens = append(tokens, token)
+		if entry.isStrike {
+			token := fmt.Sprintf("%v(%v)[strike]", entry.ip, entry.count)
+			tokens = append(tokens, token)
+		} else {
+			token := fmt.Sprintf("%v(%v)", entry.ip, entry.count)
+			tokens = append(tokens, token)
+		}
 	}
 	return strings.Join(tokens, " ")
 }
@@ -92,11 +111,16 @@ func (center *Center) scheduleBlocker() {
 	}
 	lines := strings.Split(string(stdout), "\n")
 
-	willBeBlockedList := []*BlockedIP{}
-
 	totalCount := 0
 	totalIpAccess := 0
 	totalCountWillBeBlocked := 0
+
+	willBeBlockedList := []*BlockedIP{}
+
+	for _, blockedIP := range center.potentialBlockedList {
+		blockedIP.isConsecutive = false
+	}
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if len(line) == 0 {
@@ -108,14 +132,46 @@ func (center *Center) scheduleBlocker() {
 			ip := strings.TrimSpace(tokens[1])
 			count, _ := strconv.Atoi(countStr)
 			totalCount += count
-			if count > center.env.MaxCount && !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
-				willBeBlockedList = append(willBeBlockedList, &BlockedIP{
-					ip:    ip,
-					count: count,
-				})
-				totalCountWillBeBlocked += count
+			if !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
+				if count > center.env.MaxCount {
+					willBeBlockedList = append(willBeBlockedList, &BlockedIP{
+						ip:    ip,
+						count: count,
+					})
+					totalCountWillBeBlocked += count
+				} else if count > center.env.MaxCountForStrike {
+					if center.potentialBlockedList[ip] == nil {
+						center.potentialBlockedList[ip] = &PotentialBlockedIP{
+							ip:            ip,
+							count:         count,
+							strikeCount:   1,
+							isConsecutive: true,
+						}
+					} else {
+						potentialBlockedIP := center.potentialBlockedList[ip]
+						potentialBlockedIP.strikeCount += 1
+						potentialBlockedIP.count = count
+						potentialBlockedIP.isConsecutive = true
+					}
+				}
 			}
 			totalIpAccess++
+		}
+	}
+
+	for ip, blockedIP := range center.potentialBlockedList {
+		if !blockedIP.isConsecutive {
+			delete(center.potentialBlockedList, ip)
+			continue
+		}
+		if blockedIP.strikeCount >= center.env.StrikeCount {
+			willBeBlockedList = append(willBeBlockedList, &BlockedIP{
+				ip:       ip,
+				count:    blockedIP.count,
+				isStrike: true,
+			})
+			totalCountWillBeBlocked += blockedIP.count
+			delete(center.potentialBlockedList, ip)
 		}
 	}
 	if totalCount > center.env.MaxTotalCount {
@@ -166,8 +222,9 @@ func main() {
 	renv.ParseCmd(&env)
 	log.Log("Whitelist IPs: %v", strings.Join(env.WhitelistIps, " "))
 	center := &Center{
-		env:           env,
-		blockedIpList: []*BlockedIP{},
+		env:                  env,
+		blockedIpList:        []*BlockedIP{},
+		potentialBlockedList: make(map[string]*PotentialBlockedIP),
 	}
 	if env.TelegramBotToken != "" && env.TelegramChatId != "" {
 		center.tlgBot = rano.NewRano(env.TelegramBotToken, []string{env.TelegramChatId})
