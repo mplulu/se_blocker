@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mplulu/rano"
@@ -33,13 +34,15 @@ type ENV struct {
 
 	MaxCountForStrike int `yaml:"max_count_for_strike"`
 	StrikeCount       int `yaml:"strike_count"`
+	TargetPort        int `yaml:"target_port"`
 }
 
 type Center struct {
-	env            *ENV
-	tlgBot         *rano.Rano
-	blockedIpList  []*BlockedIP
-	lastTotalCount int
+	env             *ENV
+	tlgBot          *rano.Rano
+	blockedIpList   []*BlockedIP
+	blockedIpListMu sync.Mutex
+	lastTotalCount  int
 
 	potentialBlockedList map[string]*PotentialBlockedIP
 }
@@ -74,20 +77,31 @@ func convertBlockedIPListToString(list []*BlockedIP) string {
 }
 
 func (center *Center) blockIPInFirewall(ipObjc *BlockedIP) {
-	cmd := exec.Command("sh", "-c", fmt.Sprintf(
-		`sudo firewall-cmd --timeout=%v --add-rich-rule="rule family='ipv4' source address='%v' drop"`,
-		center.env.BanDuration, ipObjc.ip))
+	// Use direct command execution to avoid shell injection and improve safety
+	// Note: We use "sudo" directly. Ensure the user running this binary has sudo access without password or is root.
+	args := []string{
+		"firewall-cmd",
+		fmt.Sprintf("--timeout=%v", center.env.BanDuration),
+		fmt.Sprintf("--add-rich-rule=rule family='ipv4' source address='%v' drop", ipObjc.ip),
+	}
+	cmd := exec.Command("sudo", args...)
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output1 %v %v", string(stdout), err)
 		return
 	}
+
+	center.blockedIpListMu.Lock()
+	defer center.blockedIpListMu.Unlock()
+
 	ipObjc.blockedAt = time.Now()
 	center.blockedIpList = append(center.blockedIpList, ipObjc)
 	log.Log("block %v(%v)", ipObjc.ip, ipObjc.count)
 }
 
 func (center *Center) IsIpAlreadyBlocked(ip string) bool {
+	center.blockedIpListMu.Lock()
+	defer center.blockedIpListMu.Unlock()
 	for _, blockedIP := range center.blockedIpList {
 		if blockedIP.ip == ip {
 			return true
@@ -102,9 +116,15 @@ func (center *Center) notifyMT(text string) {
 	}
 }
 
-func (center *Center) scheduleBlocker() {
+func (center *Center) runBlocker() {
 	env := center.env
-	cmd := exec.Command("sh", "-c", "netstat -tn 2>/dev/null | grep :443 | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr")
+	targetPort := 443
+	if env.TargetPort > 0 {
+		targetPort = env.TargetPort
+	}
+	// Use fmt.Sprintf to insert the port dynamically
+	cmdStr := fmt.Sprintf("netstat -tn 2>/dev/null | grep :%d | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr", targetPort)
+	cmd := exec.Command("sh", "-c", cmdStr)
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
 		log.LogSerious("output0 %v %v", string(stdout), err)
@@ -180,39 +200,50 @@ func (center *Center) scheduleBlocker() {
 			totalCountWillBeBlocked, len(willBeBlockedList), float64(totalCountWillBeBlocked)/float64(len(willBeBlockedList)))
 		if len(willBeBlockedList) > 0 {
 			queues := make(chan bool, 30)
-			finished := make(chan bool, 1)
-			counter := 0
+			var wg sync.WaitGroup
+
 			log.Log("will block %v ips", len(willBeBlockedList))
+
+			center.blockedIpListMu.Lock()
+			currentBlockedCount := len(center.blockedIpList)
+			center.blockedIpListMu.Unlock()
+
 			message := fmt.Sprintf("%v will block %v ips (totalConnection %v=>%v, totalIps %v, average %.2f, TotalConnWillBeBlocked %v) (blocked last %v: %v). %v",
 				center.env.OwnIp, len(willBeBlockedList),
 				center.lastTotalCount, totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess), totalCountWillBeBlocked,
-				kExpireIpBlockedDuration.String(), len(center.blockedIpList), convertBlockedIPListToString(willBeBlockedList))
+				kExpireIpBlockedDuration.String(), currentBlockedCount, convertBlockedIPListToString(willBeBlockedList))
 			center.notifyMT(message)
 			for _, ip := range willBeBlockedList {
 				queues <- true
+				wg.Add(1)
 				go func(ipInBlock *BlockedIP) {
+					defer wg.Done()
 					center.blockIPInFirewall(ipInBlock)
-					counter++
-					if counter == len(willBeBlockedList) {
-						finished <- true
-					}
 					<-queues
 				}(ip)
 			}
-			<-finished
+			wg.Wait()
 		}
 	}
 
 	filterExpiredBlockIpList := []*BlockedIP{}
+	center.blockedIpListMu.Lock()
 	for _, blockedIp := range center.blockedIpList {
 		if time.Since(blockedIp.blockedAt) <= kExpireIpBlockedDuration {
 			filterExpiredBlockIpList = append(filterExpiredBlockIpList, blockedIp)
 		}
 	}
 	center.blockedIpList = filterExpiredBlockIpList
+	center.blockedIpListMu.Unlock()
+
 	center.lastTotalCount = totalCount
-	<-time.After(kInterval)
-	go center.scheduleBlocker()
+}
+
+func (center *Center) Start() {
+	for {
+		center.runBlocker()
+		time.Sleep(kInterval)
+	}
 }
 
 func main() {
@@ -229,6 +260,6 @@ func main() {
 	if env.TelegramBotToken != "" && env.TelegramChatId != "" {
 		center.tlgBot = rano.NewRano(env.TelegramBotToken, []string{env.TelegramChatId})
 	}
-	go center.scheduleBlocker()
+	go center.Start()
 	select {}
 }
