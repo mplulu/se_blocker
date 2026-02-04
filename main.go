@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,18 +121,83 @@ func (center *Center) runBlocker() {
 	if env.TargetPort > 0 {
 		targetPort = env.TargetPort
 	}
-	// Use fmt.Sprintf to insert the port dynamically
-	cmdStr := fmt.Sprintf("netstat -tn 2>/dev/null | grep :%d | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr", targetPort)
-	cmd := exec.Command("sh", "-c", cmdStr)
+
+	// Optimization: Use 'ss' instead of 'netstat'. It is much faster (reads from netlink).
+	// We use -n (numeric), -t (tcp), -H (no header).
+	// We assume Linux environment where ss is available.
+	cmd := exec.Command("ss", "-ntH", fmt.Sprintf("sport = :%d", targetPort))
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
-		log.LogSerious("output0 %v %v", string(stdout), err)
+		log.LogSerious("ss command failed: %v output: %v", err, string(stdout))
+		return
 	}
+
 	lines := strings.Split(string(stdout), "\n")
 
 	totalCount := 0
 	totalIpAccess := 0
 	totalCountWillBeBlocked := 0
+
+	// Use a map for counting to avoid 'sort | uniq -c' shell overhead
+	ipCounts := make(map[string]int)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		// Parse IP from line.
+		// ss output format: State Recv-Q Send-Q Local_Address:Port Peer_Address:Port
+
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		var remoteAddr string
+
+		// In ss -ntH: State is usually first.
+		// ESTAB      0      0              10.0.0.1:443              1.2.3.4:5678
+		// The peer address is usually the last field.
+
+		if strings.Contains(strings.ToLower(line), "estab") || strings.Contains(strings.ToLower(line), "syn-recv") || strings.Contains(strings.ToLower(line), "time-wait") || (len(fields) >= 4 && strings.Contains(fields[0], "ESTAB")) {
+			// ss output usually puts peer address at the last or second to last index
+			// Let's grab the last field that looks like an IP:Port
+			remoteAddr = fields[len(fields)-1]
+			// For ss -ntH: State, Recv-Q, Send-Q, Local, Peer
+			// Ensure we aren't picking up something else if format is slightly different,
+			// but usually last field is safe for -ntH
+			if len(fields) >= 5 {
+				remoteAddr = fields[4]
+			}
+		} else {
+			// If it doesn't match expected states but has enough fields, try 5th column (standard ss output location for peer)
+			if len(fields) >= 5 {
+				remoteAddr = fields[4]
+			}
+		}
+
+		// Clean up the IP (remove port)
+		if strings.Contains(remoteAddr, ":") {
+			// Handle IPv6 if needed, but assuming IPv4 based on original code 'cut -d: -f1'
+			// If it's 1.2.3.4:5678, LastIndex is safer.
+			lastColon := strings.LastIndex(remoteAddr, ":")
+			if lastColon != -1 {
+				remoteAddr = remoteAddr[:lastColon]
+			}
+		} else {
+			// If no colon, might be just IP or invalid
+			continue
+		}
+
+		// Skip empty or malformed IPs
+		if remoteAddr == "" || remoteAddr == "*" {
+			continue
+		}
+
+		ipCounts[remoteAddr]++
+	}
 
 	willBeBlockedList := []*BlockedIP{}
 
@@ -141,41 +205,33 @@ func (center *Center) runBlocker() {
 		blockedIP.isConsecutive = false
 	}
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		tokens := strings.Split(line, " ")
-		if len(tokens) == 2 {
-			countStr := strings.TrimSpace(tokens[0])
-			ip := strings.TrimSpace(tokens[1])
-			count, _ := strconv.Atoi(countStr)
-			totalCount += count
-			if !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
-				if count > center.env.MaxCount {
-					willBeBlockedList = append(willBeBlockedList, &BlockedIP{
-						ip:    ip,
-						count: count,
-					})
-					totalCountWillBeBlocked += count
-				} else if center.env.MaxCountForStrike > 0 && count > center.env.MaxCountForStrike {
-					if center.potentialBlockedList[ip] == nil {
-						center.potentialBlockedList[ip] = &PotentialBlockedIP{
-							ip:            ip,
-							count:         count,
-							strikeCount:   1,
-							isConsecutive: true,
-						}
-					} else {
-						potentialBlockedIP := center.potentialBlockedList[ip]
-						potentialBlockedIP.strikeCount += 1
-						potentialBlockedIP.count = count
-						potentialBlockedIP.isConsecutive = true
+	// Process counts
+	for ip, count := range ipCounts {
+		totalCount += count
+		totalIpAccess++ // Distinct IPs
+
+		if !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
+			if count > center.env.MaxCount {
+				willBeBlockedList = append(willBeBlockedList, &BlockedIP{
+					ip:    ip,
+					count: count,
+				})
+				totalCountWillBeBlocked += count
+			} else if center.env.MaxCountForStrike > 0 && count > center.env.MaxCountForStrike {
+				if center.potentialBlockedList[ip] == nil {
+					center.potentialBlockedList[ip] = &PotentialBlockedIP{
+						ip:            ip,
+						count:         count,
+						strikeCount:   1,
+						isConsecutive: true,
 					}
+				} else {
+					potentialBlockedIP := center.potentialBlockedList[ip]
+					potentialBlockedIP.strikeCount += 1
+					potentialBlockedIP.count = count
+					potentialBlockedIP.isConsecutive = true
 				}
 			}
-			totalIpAccess++
 		}
 	}
 
