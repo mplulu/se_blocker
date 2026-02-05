@@ -3,23 +3,23 @@ package main
 import (
 	"flag"
 	"fmt"
-	"math/rand"
+	"net"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/mplulu/rano"
-
-	"github.com/mplulu/renv"
-
-	"github.com/mplulu/utils"
-
 	"github.com/mplulu/log"
+	"github.com/mplulu/rano"
+	"github.com/mplulu/renv"
 )
 
 const kInterval = 1 * time.Second
-const kExpireIpBlockedDuration = 10 * time.Minute
+
+// cache TTL to avoid re-blocking IPs that appear in ss due to lingering connections (actual ban is BanDuration in ipset)
+const kRecentlyBlockedCacheTTL = 10 * time.Minute
+const kIpsetNameV4 = "se_blocked_v4"
+const kIpsetNameV6 = "se_blocked_v6"
 
 type ENV struct {
 	WhitelistIps     []string `yaml:"whitelist_ips"`
@@ -37,13 +37,17 @@ type ENV struct {
 }
 
 type Center struct {
-	env             *ENV
-	tlgBot          *rano.Rano
-	blockedIpList   []*BlockedIP
-	blockedIpListMu sync.Mutex
-	lastTotalCount  int
+	env                  *ENV
+	tlgBot               *rano.Rano
+	recentlyBlockedCache map[string]*BlockedIP
+	recentlyBlockedMu    sync.RWMutex
+	lastTotalCount       int
 
-	potentialBlockedList map[string]*PotentialBlockedIP
+	potentialBlockedMap map[string]*PotentialBlockedIP
+	potentialBlockedMu  sync.Mutex
+
+	whitelistMap map[string]bool
+	ipsetReady   bool
 }
 
 type BlockedIP struct {
@@ -61,6 +65,65 @@ type PotentialBlockedIP struct {
 	isConsecutive bool
 }
 
+func isValidIP(ip string) bool {
+	return net.ParseIP(ip) != nil
+}
+
+func isIPv6(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	return parsed.To4() == nil
+}
+
+func (center *Center) isWhitelisted(ip string) bool {
+	return center.whitelistMap[ip]
+}
+
+func (center *Center) initIpset() error {
+	createV4 := exec.Command("sudo", "ipset", "create", kIpsetNameV4, "hash:ip", "timeout", "0", "-exist")
+	if output, err := createV4.CombinedOutput(); err != nil {
+		log.LogSerious("failed to create ipset v4: %v %v", string(output), err)
+		return err
+	}
+
+	createV6 := exec.Command("sudo", "ipset", "create", kIpsetNameV6, "hash:ip", "family", "inet6", "timeout", "0", "-exist")
+	if output, err := createV6.CombinedOutput(); err != nil {
+		log.LogSerious("failed to create ipset v6: %v %v", string(output), err)
+		return err
+	}
+
+	ruleV4 := exec.Command("sudo", "firewall-cmd",
+		"--permanent",
+		fmt.Sprintf("--add-rich-rule=rule family='ipv4' source ipset='%s' drop", kIpsetNameV4))
+	if output, err := ruleV4.CombinedOutput(); err != nil {
+		outputStr := string(output)
+		if !strings.Contains(outputStr, "ALREADY_ENABLED") {
+			log.LogSerious("failed to add firewall rule v4: %v %v", outputStr, err)
+		}
+	}
+
+	ruleV6 := exec.Command("sudo", "firewall-cmd",
+		"--permanent",
+		fmt.Sprintf("--add-rich-rule=rule family='ipv6' source ipset='%s' drop", kIpsetNameV6))
+	if output, err := ruleV6.CombinedOutput(); err != nil {
+		outputStr := string(output)
+		if !strings.Contains(outputStr, "ALREADY_ENABLED") {
+			log.LogSerious("failed to add firewall rule v6: %v %v", outputStr, err)
+		}
+	}
+
+	reload := exec.Command("sudo", "firewall-cmd", "--reload")
+	if output, err := reload.CombinedOutput(); err != nil {
+		log.LogSerious("failed to reload firewall: %v %v", string(output), err)
+		return err
+	}
+
+	log.Log("ipset initialized: %s (IPv4), %s (IPv6)", kIpsetNameV4, kIpsetNameV6)
+	return nil
+}
+
 func convertBlockedIPListToString(list []*BlockedIP) string {
 	tokens := []string{}
 	for _, entry := range list {
@@ -76,37 +139,59 @@ func convertBlockedIPListToString(list []*BlockedIP) string {
 }
 
 func (center *Center) blockIPInFirewall(ipObjc *BlockedIP) {
-	// Use direct command execution to avoid shell injection and improve safety
-	// Note: We use "sudo" directly. Ensure the user running this binary has sudo access without password or is root.
-	args := []string{
-		"firewall-cmd",
-		fmt.Sprintf("--timeout=%v", center.env.BanDuration),
-		fmt.Sprintf("--add-rich-rule=rule family='ipv4' source address='%v' drop", ipObjc.ip),
-	}
-	cmd := exec.Command("sudo", args...)
-	stdout, err := cmd.CombinedOutput()
-	if err != nil {
-		log.LogSerious("output1 %v %v", string(stdout), err)
+	if !isValidIP(ipObjc.ip) {
+		log.LogSerious("invalid IP format: %v", ipObjc.ip)
 		return
 	}
 
-	center.blockedIpListMu.Lock()
-	defer center.blockedIpListMu.Unlock()
+	var cmd *exec.Cmd
+	if center.ipsetReady {
+		ipsetName := kIpsetNameV4
+		if isIPv6(ipObjc.ip) {
+			ipsetName = kIpsetNameV6
+		}
+		timeoutSecs := center.getBanDurationSeconds()
+		cmd = exec.Command("sudo", "ipset", "add", ipsetName, ipObjc.ip, "timeout", fmt.Sprintf("%d", timeoutSecs), "-exist")
+	} else {
+		family := "ipv4"
+		if isIPv6(ipObjc.ip) {
+			family = "ipv6"
+		}
+		args := []string{
+			"firewall-cmd",
+			fmt.Sprintf("--timeout=%v", center.env.BanDuration),
+			fmt.Sprintf("--add-rich-rule=rule family='%s' source address='%v' drop", family, ipObjc.ip),
+		}
+		cmd = exec.Command("sudo", args...)
+	}
+
+	stdout, err := cmd.CombinedOutput()
+	if err != nil {
+		log.LogSerious("block failed %v %v", string(stdout), err)
+		return
+	}
+
+	center.recentlyBlockedMu.Lock()
+	defer center.recentlyBlockedMu.Unlock()
 
 	ipObjc.blockedAt = time.Now()
-	center.blockedIpList = append(center.blockedIpList, ipObjc)
-	log.Log("block %v(%v)", ipObjc.ip, ipObjc.count)
+	center.recentlyBlockedCache[ipObjc.ip] = ipObjc
+	log.Log("block %v(%v) ipv6=%v", ipObjc.ip, ipObjc.count, isIPv6(ipObjc.ip))
 }
 
-func (center *Center) IsIpAlreadyBlocked(ip string) bool {
-	center.blockedIpListMu.Lock()
-	defer center.blockedIpListMu.Unlock()
-	for _, blockedIP := range center.blockedIpList {
-		if blockedIP.ip == ip {
-			return true
-		}
+func (center *Center) getBanDurationSeconds() int64 {
+	duration, err := time.ParseDuration(center.env.BanDuration)
+	if err != nil {
+		return 3600
 	}
-	return false
+	return int64(duration.Seconds())
+}
+
+func (center *Center) isRecentlyBlocked(ip string) bool {
+	center.recentlyBlockedMu.RLock()
+	defer center.recentlyBlockedMu.RUnlock()
+	_, exists := center.recentlyBlockedCache[ip]
+	return exists
 }
 
 func (center *Center) notifyMT(text string) {
@@ -122,9 +207,6 @@ func (center *Center) runBlocker() {
 		targetPort = env.TargetPort
 	}
 
-	// Optimization: Use 'ss' instead of 'netstat'. It is much faster (reads from netlink).
-	// We use -n (numeric), -t (tcp), -H (no header).
-	// We assume Linux environment where ss is available.
 	cmd := exec.Command("ss", "-ntH", fmt.Sprintf("sport = :%d", targetPort))
 	stdout, err := cmd.CombinedOutput()
 	if err != nil {
@@ -147,70 +229,45 @@ func (center *Center) runBlocker() {
 			continue
 		}
 
-		// Parse IP from line.
-		// ss output format: State Recv-Q Send-Q Local_Address:Port Peer_Address:Port
-
+		// ss -ntH output format: State Recv-Q Send-Q Local_Address:Port Peer_Address:Port
+		// Example: ESTAB 0 0 10.0.0.1:443 1.2.3.4:5678
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		if len(fields) < 5 {
 			continue
 		}
 
-		var remoteAddr string
-
-		// In ss -ntH: State is usually first.
-		// ESTAB      0      0              10.0.0.1:443              1.2.3.4:5678
-		// The peer address is usually the last field.
-
-		if strings.Contains(strings.ToLower(line), "estab") || strings.Contains(strings.ToLower(line), "syn-recv") || strings.Contains(strings.ToLower(line), "time-wait") || (len(fields) >= 4 && strings.Contains(fields[0], "ESTAB")) {
-			// ss output usually puts peer address at the last or second to last index
-			// Let's grab the last field that looks like an IP:Port
-			remoteAddr = fields[len(fields)-1]
-			// For ss -ntH: State, Recv-Q, Send-Q, Local, Peer
-			// Ensure we aren't picking up something else if format is slightly different,
-			// but usually last field is safe for -ntH
-			if len(fields) >= 5 {
-				remoteAddr = fields[4]
-			}
-		} else {
-			// If it doesn't match expected states but has enough fields, try 5th column (standard ss output location for peer)
-			if len(fields) >= 5 {
-				remoteAddr = fields[4]
-			}
-		}
-
-		// Clean up the IP (remove port)
-		if strings.Contains(remoteAddr, ":") {
-			// Handle IPv6 if needed, but assuming IPv4 based on original code 'cut -d: -f1'
-			// If it's 1.2.3.4:5678, LastIndex is safer.
-			lastColon := strings.LastIndex(remoteAddr, ":")
-			if lastColon != -1 {
-				remoteAddr = remoteAddr[:lastColon]
-			}
-		} else {
-			// If no colon, might be just IP or invalid
+		remoteAddr := fields[4]
+		if !strings.Contains(remoteAddr, ":") {
 			continue
 		}
 
-		// Skip empty or malformed IPs
-		if remoteAddr == "" || remoteAddr == "*" {
+		lastColon := strings.LastIndex(remoteAddr, ":")
+		if lastColon == -1 {
+			continue
+		}
+		ip := remoteAddr[:lastColon]
+		ip = strings.TrimPrefix(ip, "[")
+		ip = strings.TrimSuffix(ip, "]")
+
+		if ip == "" || ip == "*" || !isValidIP(ip) {
 			continue
 		}
 
-		ipCounts[remoteAddr]++
+		ipCounts[ip]++
 	}
 
 	willBeBlockedList := []*BlockedIP{}
 
-	for _, blockedIP := range center.potentialBlockedList {
+	center.potentialBlockedMu.Lock()
+	for _, blockedIP := range center.potentialBlockedMap {
 		blockedIP.isConsecutive = false
 	}
 
-	// Process counts
 	for ip, count := range ipCounts {
 		totalCount += count
-		totalIpAccess++ // Distinct IPs
+		totalIpAccess++
 
-		if !utils.ContainsByString(env.WhitelistIps, ip) && !center.IsIpAlreadyBlocked(ip) {
+		if !center.isWhitelisted(ip) && !center.isRecentlyBlocked(ip) {
 			if count > center.env.MaxCount {
 				willBeBlockedList = append(willBeBlockedList, &BlockedIP{
 					ip:    ip,
@@ -218,15 +275,15 @@ func (center *Center) runBlocker() {
 				})
 				totalCountWillBeBlocked += count
 			} else if center.env.MaxCountForStrike > 0 && count > center.env.MaxCountForStrike {
-				if center.potentialBlockedList[ip] == nil {
-					center.potentialBlockedList[ip] = &PotentialBlockedIP{
+				if center.potentialBlockedMap[ip] == nil {
+					center.potentialBlockedMap[ip] = &PotentialBlockedIP{
 						ip:            ip,
 						count:         count,
 						strikeCount:   1,
 						isConsecutive: true,
 					}
 				} else {
-					potentialBlockedIP := center.potentialBlockedList[ip]
+					potentialBlockedIP := center.potentialBlockedMap[ip]
 					potentialBlockedIP.strikeCount += 1
 					potentialBlockedIP.count = count
 					potentialBlockedIP.isConsecutive = true
@@ -235,9 +292,9 @@ func (center *Center) runBlocker() {
 		}
 	}
 
-	for ip, blockedIP := range center.potentialBlockedList {
+	for ip, blockedIP := range center.potentialBlockedMap {
 		if !blockedIP.isConsecutive {
-			delete(center.potentialBlockedList, ip)
+			delete(center.potentialBlockedMap, ip)
 			continue
 		}
 		if blockedIP.strikeCount >= center.env.StrikeCount {
@@ -247,27 +304,38 @@ func (center *Center) runBlocker() {
 				isStrike: true,
 			})
 			totalCountWillBeBlocked += blockedIP.count
-			delete(center.potentialBlockedList, ip)
+			delete(center.potentialBlockedMap, ip)
 		}
 	}
+	center.potentialBlockedMu.Unlock()
 	if totalCount > center.env.MaxTotalCount {
+		avgPerIp := float64(0)
+		if totalIpAccess > 0 {
+			avgPerIp = float64(totalCount) / float64(totalIpAccess)
+		}
+		avgWillBeBlocked := float64(0)
+		if len(willBeBlockedList) > 0 {
+			avgWillBeBlocked = float64(totalCountWillBeBlocked) / float64(len(willBeBlockedList))
+		}
+
 		log.Log("Stats totalConnection %v, totalIps %v, average %.2f. TotalConnWillBeBlocked %v, totalIpsWillBeBlocked %v, average %.2f ",
-			totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess),
-			totalCountWillBeBlocked, len(willBeBlockedList), float64(totalCountWillBeBlocked)/float64(len(willBeBlockedList)))
+			totalCount, totalIpAccess, avgPerIp,
+			totalCountWillBeBlocked, len(willBeBlockedList), avgWillBeBlocked)
+
 		if len(willBeBlockedList) > 0 {
 			queues := make(chan bool, 30)
 			var wg sync.WaitGroup
 
 			log.Log("will block %v ips", len(willBeBlockedList))
 
-			center.blockedIpListMu.Lock()
-			currentBlockedCount := len(center.blockedIpList)
-			center.blockedIpListMu.Unlock()
+			center.recentlyBlockedMu.RLock()
+			recentlyBlockedCount := len(center.recentlyBlockedCache)
+			center.recentlyBlockedMu.RUnlock()
 
 			message := fmt.Sprintf("%v will block %v ips (totalConnection %v=>%v, totalIps %v, average %.2f, TotalConnWillBeBlocked %v) (blocked last %v: %v). %v",
 				center.env.OwnIp, len(willBeBlockedList),
-				center.lastTotalCount, totalCount, totalIpAccess, float64(totalCount)/float64(totalIpAccess), totalCountWillBeBlocked,
-				kExpireIpBlockedDuration.String(), currentBlockedCount, convertBlockedIPListToString(willBeBlockedList))
+				center.lastTotalCount, totalCount, totalIpAccess, avgPerIp, totalCountWillBeBlocked,
+				kRecentlyBlockedCacheTTL.String(), recentlyBlockedCount, convertBlockedIPListToString(willBeBlockedList))
 			center.notifyMT(message)
 			for _, ip := range willBeBlockedList {
 				queues <- true
@@ -282,15 +350,13 @@ func (center *Center) runBlocker() {
 		}
 	}
 
-	filterExpiredBlockIpList := []*BlockedIP{}
-	center.blockedIpListMu.Lock()
-	for _, blockedIp := range center.blockedIpList {
-		if time.Since(blockedIp.blockedAt) <= kExpireIpBlockedDuration {
-			filterExpiredBlockIpList = append(filterExpiredBlockIpList, blockedIp)
+	center.recentlyBlockedMu.Lock()
+	for ip, blockedIp := range center.recentlyBlockedCache {
+		if time.Since(blockedIp.blockedAt) > kRecentlyBlockedCacheTTL {
+			delete(center.recentlyBlockedCache, ip)
 		}
 	}
-	center.blockedIpList = filterExpiredBlockIpList
-	center.blockedIpListMu.Unlock()
+	center.recentlyBlockedMu.Unlock()
 
 	center.lastTotalCount = totalCount
 }
@@ -304,15 +370,29 @@ func (center *Center) Start() {
 
 func main() {
 	flag.Parse()
-	rand.Seed(time.Now().UTC().UnixNano())
 	var env *ENV
 	renv.ParseCmd(&env)
 	log.Log("Whitelist IPs: %v", strings.Join(env.WhitelistIps, " "))
+
+	whitelistMap := make(map[string]bool)
+	for _, ip := range env.WhitelistIps {
+		whitelistMap[ip] = true
+	}
+
 	center := &Center{
 		env:                  env,
-		blockedIpList:        []*BlockedIP{},
-		potentialBlockedList: make(map[string]*PotentialBlockedIP),
+		recentlyBlockedCache: make(map[string]*BlockedIP),
+		potentialBlockedMap:  make(map[string]*PotentialBlockedIP),
+		whitelistMap:         whitelistMap,
 	}
+
+	if err := center.initIpset(); err != nil {
+		log.Log("ipset init failed, falling back to individual firewall rules: %v", err)
+		center.ipsetReady = false
+	} else {
+		center.ipsetReady = true
+	}
+
 	if env.TelegramBotToken != "" && env.TelegramChatId != "" {
 		center.tlgBot = rano.NewRano(env.TelegramBotToken, []string{env.TelegramChatId})
 	}
